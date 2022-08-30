@@ -312,7 +312,7 @@ class VersionSet {
 
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
-  std::string compact_pointer_[config::kNumLevels];
+  std::string compact_pointer_[config::kNumLevels]; //compact_pointer记录了本level上次compact的最大的key
 };
 
 // A Compaction encapsulates information about a compaction.
@@ -357,7 +357,7 @@ class Compaction {
   // is successful.
   void ReleaseInputs();
 
- private:
+public:
   friend class Version;
   friend class VersionSet;
 

@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <iostream>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -22,6 +23,7 @@
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
+#include "db/db_impl.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "leveldb/status.h"
@@ -36,7 +38,17 @@
 #include "util/mutexlock.h"
 
 namespace leveldb {
-
+enum LOG_TYPE {
+  FLUSH = 1,
+  COMPACTION = 2,
+  OTHER = 10
+};
+void add_level_file_num(int level);
+void profiling_print();
+void add_outputs(DBImpl::CompactionState *c);
+void add_flush(VersionEdit *edit);
+void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c);
+void print_compaction(Compaction *c, int level);
 const int kNumNonTableCacheFiles = 10;
 
 // Information kept for every waiting writer
@@ -52,6 +64,7 @@ struct DBImpl::Writer {
 };
 
 struct DBImpl::CompactionState {
+public:
   // Files produced by compaction
   struct Output {
     uint64_t number;
@@ -150,6 +163,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
                                &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
+  profiling_print();
   // Wait for background work to finish.
   mutex_.Lock();
   shutting_down_.store(true, std::memory_order_release);
@@ -546,6 +560,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   return s;
 }
 
+
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
@@ -723,19 +738,22 @@ void DBImpl::BackgroundCompaction() {
         (m->end ? m->end->DebugString().c_str() : "(end)"),
         (m->done ? "(end)" : manual_end.DebugString().c_str()));
   } else {
+    //在这里面我们打了日志log_print来统计即将被compact的SST file的信息
     c = versions_->PickCompaction();
   }
 
   Status status;
   if (c == nullptr) {
     // Nothing to do
-  } else if (!is_manual && c->IsTrivialMove()) {
+  } else if (!is_manual && c->IsTrivialMove()) { //如果level i只有一个文件且level i+1没有文件
+    
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                        f->largest);
+    add_level_file_num(c->level() + 1);
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -747,6 +765,7 @@ void DBImpl::BackgroundCompaction() {
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
     CompactionState* compact = new CompactionState(c);
+    //在DoCompactionWork中统计了add_outputs
     status = DoCompactionWork(compact);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -878,9 +897,10 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
       compact->compaction->num_input_files(1), compact->compaction->level() + 1,
       static_cast<long long>(compact->total_bytes));
 
-  // Add compaction outputs
+  // Add compaction outputs 把compact的文件全都删除
   compact->compaction->AddInputDeletions(compact->compaction->edit());
   const int level = compact->compaction->level();
+  //把所有生成的文件全都添加
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
@@ -901,17 +921,39 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+  /*Step1: 获取最旧的仍然在被使用的快照(snapshot)。所谓快照，指的是版本号，即某个sequence。
+  一个快照表示插入该sequence的key后的瞬时状态，不受后续写入key的影响。用户读取时，如果指定快照，
+  那么对用户来说，整个数据库始终处于该快照的状态，后续写入key或者删除key都不会影响用户读到的结果。
+  
+  这里检查snapshots_列表，如果为空，就把smallest_snapshot置为最新的sequence，如果snapshots_不为空，
+  就把smallest_snapshot置为最老的snapshot。smallest_snapshot在后面将被用于判断重复的user key是否可以删除。*/
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
 
+  //Step2:
+  /*这里只有两行，但是逻辑一点都不少。
+  面PickCompaction把要合并的level层和level+1层文件保存在了compact->compaction中，
+  每个SST文件内部都是有序的，现在合并这些SST文件其实就是合并多个有序列表，那么每次都要挑选最小的key加入。
+  MakeInputIterator是对这个逻辑封装，返回的Iterator，每次调用Next返回下一个最小的key。
+  对后续的逻辑来说就是用这个Iterator按顺序取key，生成新的SST文件
+  */
+
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
   // Release mutex while we're actually doing the compaction work
   mutex_.Unlock();
 
+
+  //Step3: 
+  /*
+  把Iterator指向第一个key，然后初始化一些字段。current_user_key记录上一个key，
+  初始为空。has_current_user_key表示是否有上一个key，
+  初始为false。last_sequence_for_key记录上一个key的sequence，
+  初始为kMaxSequenceNumber，此时表示没有上一个key。
+  */
   input->SeekToFirst();
   Status status;
   ParsedInternalKey ikey;
@@ -920,6 +962,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
     // Prioritize immutable compaction work
+    //Step3.1
+    /*如果imm_(即Immutable Memtable）不为空，就先把imm_落盘，这里和合并逻辑没有关系，
+    因为落盘imm_和合并SST都是要加锁的，两者不能同时进行，所以优先落盘imm_，以免后台合并阻塞了imm_落盘，
+    进而影响Memtable的写入。详细逻辑请见LevelDB源码解析(12) Memtable落盘。
+    */
     if (has_imm_.load(std::memory_order_relaxed)) {
       const uint64_t imm_start = env_->NowMicros();
       mutex_.Lock();
@@ -932,6 +979,15 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       imm_micros += (env_->NowMicros() - imm_start);
     }
 
+    //Step3.2
+    /*多个level层和level+1层SST文件的合并会产生多个level+1层SST文件，
+    ShouldStopBefore用于判断是否结束当前输出文件的，
+    ShouldStopBefor比较当前文件已经插入的key和level+2层重叠的文件的总size是否超过阈值，
+    如果超过，就结束文件。避免这个新的level+1层文件和level+2层重叠的文件数太多，
+    导致以后该level+1层文件合并到level+2层时牵扯到太多level+2层文件。
+    如果ShouldStopBefore判断应当结束文件，就会调用FinishCompactionOutputFile填充文件尾部的数据，
+    并结束文件，一个新的SST文件就诞生了。
+    */
     Slice key = input->key();
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != nullptr) {
@@ -941,7 +997,12 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       }
     }
 
+    //Step3.3
     // Handle key/value, add to state, etc.
+    /*前面说过internal key由user key + seq + type 组成，一个user key可能有多个版本的internal key，
+    旧版本的inernal key可能是不需要的，这一步就是要找出不需要的旧版本internal key。首先解析产生user key，
+    如果解析失败，那么不会对这个key进行处理，一会儿会被直接插入到新SST文件中。
+    */
     bool drop = false;
     if (!ParseInternalKey(key, &ikey)) {
       // Do not hide error keys
@@ -985,7 +1046,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         compact->compaction->IsBaseLevelForKey(ikey.user_key),
         (int)last_sequence_for_key, (int)compact->smallest_snapshot);
 #endif
-
+    //Step 3.4
+    /*如果drop为true，那么直接跳过本步骤，这个key就被丢弃了。如果drop为false，那么执行本步骤。
+    如果builder为空，新建一个SST文件用于输出，比如前面FinishCompactionOutputFile结束一个文件后，
+    builder就会被置为空，这里就需要新建一个文件了。然后调用Add把当前internal key加入到新文件中。
+    然后判断新文件的size是否超过了阈值，如果超过了就调用FinishCompactionOutputFile结束当前文件。
+    构建文件复用了Memtable落盘使用的TableBuilder，详细逻辑请见LevelDB源码解析(10) TableBuilder（Memtable序列化）
+    */
     if (!drop) {
       // Open output file if necessary
       if (compact->builder == nullptr) {
@@ -1013,6 +1080,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     input->Next();
   }
 
+
+  //Step4:
   if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
     status = Status::IOError("Deleting DB during compaction");
   }
@@ -1025,6 +1094,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   delete input;
   input = nullptr;
 
+  //Step5:
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
   for (int which = 0; which < 2; which++) {
@@ -1035,11 +1105,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
+  add_outputs(compact);
 
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
+    //应用修改
     status = InstallCompactionResults(compact);
   }
   if (!status.ok()) {
@@ -1555,5 +1627,129 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
   }
   return result;
 }
+
+int flush_num, compaction_num;
+#define get_clock() (flush_num + compaction_num)
+
+const int FlushLevel = 2;
+const int CompactLevel = 6;
+
+int flush_level[7]; //每个level被Flush的次数
+int compact_level[7]; //每个level被compact的次数
+uint64_t compact_level_lifetime[7]; //被compact的SST file的总的lifetime
+uint32_t correct_predict_time[7]; //进行了预测的SST file中正确预测的文件数量
+uint32_t compacted_number[7]; //进行了预测的SST file中被合并的文件数量
+uint32_t level_file_num[7];
+const int PREDICT_THRESHOLD = 10;
+void add_level_file_num(int level) {
+  level_file_num[level]++;
+}
+int get_ave_time(int level) {
+  return compact_level_lifetime[level] / compacted_number[level];
+}
+//目前的策略是根据平均时间来进行预测
+int get_predict(int level) {
+  return get_ave_time(level);
+}
+double get_predict_rate(int level) {
+  return (double) correct_predict_time[level] / compacted_number[level];
+}
+//level层的某个文件被compact后调用
+//统计相关信息
+void add_calc(int level, int lifetime, int predict_lifetime) {
+  level_file_num[level]--;
+  compacted_number[level]++;
+  correct_predict_time[level] += (abs(lifetime - predict_lifetime) <= PREDICT_THRESHOLD);
+  compact_level_lifetime[level] += lifetime;
+}
+std::map<int, int> pre; //key: file_number value: file被创建的时间
+std::map<int, int> predict; //key: file_number value: 预测的lifetime的值
+
+//Compact/Flush之前调用log_print来打印相关日志
+void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
+  if(c == nullptr) return;
+  if(log_type == FLUSH) {
+    flush_num++;
+    flush_level[level]++;
+  } else if(log_type == COMPACTION) {
+    compaction_num++;
+    compact_level[level]++;
+  }
+  printf("%s flush_num=%d compaction_num=%d level=%d\n", s, flush_num, compaction_num, level);
+  if(log_type == COMPACTION) 
+    print_compaction(c, level);
+  if((flush_num + compaction_num) % 50 == 0) {
+    profiling_print();
+  }
+
+}
+
+//compact完成后调用此函数
+// print_compaction: printf to be compacted SST file information,
+//1. 打印SST file的信息number, lifetime, predict_time
+//2. 更新add_calc级预测的准确率以及被compact的file的总lifetime
+void print_compaction(Compaction *c, int level) {
+  if(c == nullptr) return ;
+
+  printf("level=%d\n", level);
+  for(auto &x: c->edit()->compact_pointers_) {
+    printf("cp level=%d ", x.first);
+    std::cout << x.second.user_key().ToString() << '\n';
+  }
+
+  for(int i = 0; i < 2; i++) {
+    printf("vector[%d] element:\n", i);
+    for(int j = 0; j < c->num_input_files(i); j++) {
+      FileMetaData *tmp = c->input(i, j);
+      uint64_t number = tmp->number;
+      printf("number=%ld allowed_seeks=%d clock=%d ", 
+          number, tmp->allowed_seeks, get_clock());
+      std::cout << "smallest_key="<< tmp->smallest.user_key().ToString()
+           << " largest_key=" << tmp->largest.user_key().ToString();
+      
+      if(pre.find(number) != pre.end()) {
+        int lifetime = get_clock() - pre[number];
+        printf(" lifetime=%d predict_time=%d level_file_num=%d", lifetime, predict[number], level_file_num[c->level() + i]);
+        add_calc(c->level() + i, lifetime, predict[number]);
+      }
+      putchar('\n');
+    }
+  }
+}
+//每50次Compact会调用此函数打印状态
+//printf profiling information
+void profiling_print() {
+  printf("Profiling\n");
+  for(int i = 0; i <= FlushLevel; i++) {
+    printf("FlushLevel %d=%d\n", i, flush_level[i]);
+  }
+  for(int i = 0; i <= CompactLevel; i++) {
+    printf("CompactLevel %d=%d ave_lifetime=%d rate=%.2lf level_file_num=%d\n", i, compact_level[i], get_ave_time(i), get_predict_rate(i), level_file_num[i]);
+  }
+}
+
+//Compact完成后调用此函数添加新生成的SST file
+//初始化SST file被创建的时间，进行predict预测
+//add Compact file; update pre[] and make_predict
+void add_outputs(DBImpl::CompactionState *c) {
+  for(int i = 0; i < c->outputs.size(); i++) {
+    DBImpl::CompactionState::Output x = c->outputs[i];
+    pre[x.number] = get_clock();
+    int predict_time = get_predict(c->compaction->level());
+    level_file_num[c->compaction->level()]++;
+    predict[x.number] = predict_time;
+    printf("pre_number=%ld clock=%d predict=%d\n", x.number, get_clock(), predict_time);
+  }
+}
+//Flush完成后调用此函数添加新生成的SST file
+void add_flush(VersionEdit *edit) {
+  for(auto &x: edit->new_files_) {
+    auto &y = x.second;
+    level_file_num[x.first]++;
+    pre[y.number] = get_clock();
+    printf("flush_pre_number=%ld clock=%d\n", y.number, get_clock());
+  }
+}
+
 
 }  // namespace leveldb

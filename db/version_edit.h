@@ -80,7 +80,7 @@ class VersionEdit {
 
   std::string DebugString() const;
 
- private:
+ public:
   friend class VersionSet;
 
   typedef std::set<std::pair<int, uint64_t>> DeletedFileSet;
