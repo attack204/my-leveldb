@@ -1634,6 +1634,7 @@ const int FlushLevel = 2;
 const int CompactLevel = 6;
 const int INF = 1e9;
 
+
 int flush_level[7]; //每个level被Flush的次数
 int compact_level[7]; //每个level被compact的次数
 uint64_t compact_level_lifetime[7]; //被compact的SST file的总的lifetime
@@ -1641,6 +1642,9 @@ uint32_t correct_predict_time[7]; //进行了预测的SST file中正确预测的
 uint32_t compacted_number[7]; //进行了预测的SST file中被合并的文件数量
 uint32_t level_file_num[7];
 const int PREDICT_THRESHOLD = 10;
+std::map<int, int> pre; //key: file_number value: file被创建的时间
+std::map<int, int> predict; //key: file_number value: 预测的lifetime的值
+std::map<int, int> predict_type;
 void add_level_file_num(int level) {
   level_file_num[level]++;
 }
@@ -1650,6 +1654,13 @@ int get_ave_time(int level) {
 int min_int(int a, int b) {
   return a < b ? a : b;
 }
+// void print_SSTfile(FileMetaData *f) {
+//   uint64_t number = f->number;
+//   printf("number=%ld allowed_seeks=%d clock=%d ", 
+//       number, f->allowed_seeks, get_clock());
+//   std::cout << "smallest_key="<< f->smallest.user_key().ToString()
+//         << " largest_key=" << f->largest.user_key().ToString();     
+// }
 double get_factor(int level) {
   double sum = 0;
   for(int i = 0; i < 7; i++) {
@@ -1678,30 +1689,65 @@ int get_rank(int level, FileMetaData &file, Version *v) {
   else 
     return v->files_[level].size() - first_large + file_pos; //否则要转一圈才能compact
 }
+
+//pre_time是之前的层所消耗的时间
+//target是要最小化的时间
+void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int &predict, int &predict_type) {
+  if(level == 1) return ;
+  int upper_level = level - 1;
+  const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
+  const InternalKey* begin = &file.smallest;
+  const InternalKey* end   = &file.largest;
+  for(int i = 0; i < v->files_[upper_level].size(); i++) {
+    FileMetaData *f = v->files_[upper_level][i];
+    const Slice file_start = f->smallest.user_key();
+    const Slice file_limit = f->largest.user_key();
+    if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
+      // "f" is completely before specified range; skip it
+    } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
+      // "f" is completely after specified range; skip it
+    } else {
+      int T2 = get_rank(upper_level, *f, v) * get_factor(upper_level) + pre_time;
+      if(T2 < predict) {
+        predict = T2;
+        predict_type = deep;
+      }
+      dfs(level - 1, deep - 1, *f, v, pre_time + T2, predict, predict_type);
+    }
+  }
+}
+
+
 //目前的策略是根据平均时间来进行预测
-int get_predict(int level, FileMetaData &file, Version *v) { 
+void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &predict_type) { 
   std::string cp = v->vset_->compact_pointer_[level];
-  int T1 = get_rank(level, file, v) * get_factor(level);
+  predict = get_rank(level, file, v) * get_factor(level);
+  predict_type = 0;
   int T2 = INF, times = 0;
   if(level == 0) ;
   else {
-    const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
-    const InternalKey* begin = &file.smallest;
-    const InternalKey* end   = &file.largest;
-    for(int i = 0; i < v->files_[level - 1].size(); i++) {
-      FileMetaData *f = v->files_[level - 1][i];
-      const Slice file_start = f->smallest.user_key();
-      const Slice file_limit = f->largest.user_key();
-      if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
-        // "f" is completely before specified range; skip it
-      } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
-        // "f" is completely after specified range; skip it
-      } else {
-        T2 = min_int(T2, get_rank(level - 1, *f, v) * get_factor(level));
-      }
-    }
+    dfs(level, 0, file, v, 0, predict, predict_type);
+    // int upper_level = level - 1;
+    // const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
+    // const InternalKey* begin = &file.smallest;
+    // const InternalKey* end   = &file.largest;
+    // for(int i = 0; i < v->files_[upper_level].size(); i++) {
+    //   FileMetaData *f = v->files_[upper_level][i];
+    //   const Slice file_start = f->smallest.user_key();
+    //   const Slice file_limit = f->largest.user_key();
+    //   if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
+    //     // "f" is completely before specified range; skip it
+    //   } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
+    //     // "f" is completely after specified range; skip it
+    //   } else {
+    //     int T2 = get_rank(upper_level, *f, v) * get_factor(upper_level);
+    //     if(T2 < predict) {
+    //       predict = T2;
+    //       predict_type = -1;
+    //     }
+    //   }
+    // }
   }
-  return min_int(T1, T2);
 }
 double get_predict_rate(int level) {
   return (double) correct_predict_time[level] / compacted_number[level];
@@ -1714,8 +1760,6 @@ void add_calc(int level, int lifetime, int predict_lifetime) {
   correct_predict_time[level] += (abs(lifetime - predict_lifetime) <= PREDICT_THRESHOLD);
   compact_level_lifetime[level] += lifetime;
 }
-std::map<int, int> pre; //key: file_number value: file被创建的时间
-std::map<int, int> predict; //key: file_number value: 预测的lifetime的值
 
 //Compact/Flush之前调用log_print来打印相关日志
 void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
@@ -1753,20 +1797,47 @@ void print_compaction(Compaction *c, int level) {
     for(int j = 0; j < c->num_input_files(i); j++) {
       FileMetaData *tmp = c->input(i, j);
       uint64_t number = tmp->number;
-      printf("number=%ld allowed_seeks=%d clock=%d ", 
-          number, tmp->allowed_seeks, get_clock());
-      std::cout << "smallest_key="<< tmp->smallest.user_key().ToString()
-           << " largest_key=" << tmp->largest.user_key().ToString();
-      
+      printf("number=%ld clock=%d ", 
+            number, get_clock());
+        // std::cout << "smallest_key="<< tmp->smallest.user_key().ToString()
+        //       << " largest_key=" << tmp->largest.user_key().ToString();   
       if(pre.find(number) != pre.end()) {
         int lifetime = get_clock() - pre[number];
-        printf(" lifetime=%d predict_time=%d level_file_num=%d", lifetime, predict[number], level_file_num[c->level() + i]);
+        printf(" lifetime=%d predict_time=%d predict_type=%d level_file_num=%d", lifetime, predict[number], predict_type[number], level_file_num[c->level() + i]);
         add_calc(c->level() + i, lifetime, predict[number]);
       }
       putchar('\n');
     }
   }
 }
+
+//flush/compact的最后后调用此函数, 此函数可以调用最新的Version信息
+void add_flush(Version *v) {
+  puts("AllFiles");
+  for(int level = 0; level < config::kNumLevels; level++) {
+    printf("level %d:", level);
+    for(int i = 0; i < v->new_files[level].size(); i++) {
+      FileMetaData *tmp = v->new_files[level][i];
+      std::cout << "["<< tmp->smallest.user_key().ToString()
+                << "," << tmp->largest.user_key().ToString()
+                << "]";
+    }
+    puts("");
+  }
+  for(int level = 0; level < config::kNumLevels; level++) {
+    for(int i = 0; i < v->new_files[level].size(); i++) {
+      FileMetaData *y = v->new_files[level][i]; 
+      level_file_num[level]++; //level
+      get_predict(level, *y, v, predict[y->number], predict_type[y->number]);
+     // predict[y->number] *= 4;
+      pre[y->number] = get_clock();
+      printf("pre_number=%ld clock=%d predict=%d\n", y->number, get_clock(), predict[y->number]);  
+    }
+  }
+}
+
+
+
 //每50次Compact会调用此函数打印状态
 //printf profiling information
 void profiling_print() {
@@ -1779,50 +1850,8 @@ void profiling_print() {
   }
 }
 
-//flush/compact完成后调用此函数更新信息
-void add_flush(Version *v) {
-  // 貌似不能这么直接改
-  // for(int i = 0; i < config::kNumLevels; i++) {
-  //   level_file_num[i] = v->files_[i].size;
-  // }
-  for(int level = 0; level < config::kNumLevels; level++) {
-    for(int i = 0; i < v->new_files[level].size(); i++) {
-      FileMetaData *y = v->new_files[level][i]; 
-      level_file_num[level]++; //level
-      int predict_time = get_predict(level, *y, v);
-      predict[y->number] = predict_time;
-      pre[y->number] = get_clock();
-      printf("pre_number=%ld clock=%d predict=%d\n", y->number, get_clock(), predict_time);  
-    }
-  }
-  // for(std::pair<int, FileMetaData> &x: edit->new_files_) {
-  //   int level = x.first;
-  //   FileMetaData &y = x.second; 
-  //   level_file_num[level]++; //level
-  //   int predict_time = get_predict(level, y, v);
-  //   predict[y.number] = predict_time;
-  //   pre[y.number] = get_clock();
-  //   printf("pre_number=%ld clock=%d predict=%d\n", y.number, get_clock(), predict_time);
-  // }
-}
-
 
 }  // namespace leveldb
 
 
 
-
-
-// //Compact完成后调用此函数添加新生成的SST file
-// //初始化SST file被创建的时间，进行predict预测
-// //add Compact file; update pre[] and make_predict
-// void add_outputs(DBImpl::CompactionState *c) {
-//   for(int i = 0; i < c->outputs.size(); i++) {
-//     DBImpl::CompactionState::Output x = c->outputs[i];
-//     pre[x.number] = get_clock();
-//     int predict_time = get_predict(c->compaction->level());
-//     level_file_num[c->compaction->level()]++;
-//     predict[x.number] = predict_time;
-//     printf("pre_number=%ld clock=%d predict=%d\n", x.number, get_clock(), predict_time);
-//   }
-// }
