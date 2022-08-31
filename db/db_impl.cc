@@ -557,7 +557,6 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
-  log_print("Flush", LOG_TYPE::FLUSH, level, nullptr);
   return s;
 }
 
@@ -570,8 +569,11 @@ void DBImpl::CompactMemTable() {
   VersionEdit edit;
   Version* base = versions_->current();
   base->Ref();
+  
   Status s = WriteLevel0Table(imm_, &edit, base);
   base->Unref();
+
+  log_print("Flush", LOG_TYPE::FLUSH, edit.new_files_.back().first, nullptr);
 
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
     s = Status::IOError("Deleting DB during memtable compaction");
@@ -1651,16 +1653,13 @@ void add_level_file_num(int level) {
 int get_ave_time(int level) {
   return compact_level_lifetime[level] / compacted_number[level];
 }
+double get_predict_rate(int level) {
+  return (double) correct_predict_time[level] / compacted_number[level];
+}
 int min_int(int a, int b) {
   return a < b ? a : b;
 }
-// void print_SSTfile(FileMetaData *f) {
-//   uint64_t number = f->number;
-//   printf("number=%ld allowed_seeks=%d clock=%d ", 
-//       number, f->allowed_seeks, get_clock());
-//   std::cout << "smallest_key="<< f->smallest.user_key().ToString()
-//         << " largest_key=" << f->largest.user_key().ToString();     
-// }
+
 double get_factor(int level) {
   double sum = 0;
   for(int i = 0; i < 7; i++) {
@@ -1727,30 +1726,7 @@ void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &p
   if(level == 0) ;
   else {
     dfs(level, 0, file, v, 0, predict, predict_type);
-    // int upper_level = level - 1;
-    // const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
-    // const InternalKey* begin = &file.smallest;
-    // const InternalKey* end   = &file.largest;
-    // for(int i = 0; i < v->files_[upper_level].size(); i++) {
-    //   FileMetaData *f = v->files_[upper_level][i];
-    //   const Slice file_start = f->smallest.user_key();
-    //   const Slice file_limit = f->largest.user_key();
-    //   if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
-    //     // "f" is completely before specified range; skip it
-    //   } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
-    //     // "f" is completely after specified range; skip it
-    //   } else {
-    //     int T2 = get_rank(upper_level, *f, v) * get_factor(upper_level);
-    //     if(T2 < predict) {
-    //       predict = T2;
-    //       predict_type = -1;
-    //     }
-    //   }
-    // }
   }
-}
-double get_predict_rate(int level) {
-  return (double) correct_predict_time[level] / compacted_number[level];
 }
 //level层的某个文件被compact后调用
 //统计相关信息
@@ -1763,48 +1739,44 @@ void add_calc(int level, int lifetime, int predict_lifetime) {
 
 //Compact/Flush之前调用log_print来打印相关日志
 void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
-  if(c == nullptr) return;
+ 
+  printf("%s flush_num=%d compaction_num=%d level=%d\n", s, flush_num, compaction_num, level);
   if(log_type == FLUSH) {
     flush_num++;
     flush_level[level]++;
   } else if(log_type == COMPACTION) {
-    compaction_num++;
-    compact_level[level]++;
-  }
-  printf("%s flush_num=%d compaction_num=%d level=%d\n", s, flush_num, compaction_num, level);
-  if(log_type == COMPACTION) 
+    if(c == nullptr) return;
     print_compaction(c, level);
+  }
+
   if((flush_num + compaction_num) % 50 == 0) {
     profiling_print();
   }
 }
 
-//compact完成后调用此函数
+//compact pickCompaction之后调用此函数
 // print_compaction: printf to be compacted SST file information,
 //1. 打印SST file的信息number, lifetime, predict_time
 //2. 更新add_calc级预测的准确率以及被compact的file的总lifetime
 void print_compaction(Compaction *c, int level) {
   if(c == nullptr) return ;
-
+  compaction_num++;
+  compact_level[level]++;
   printf("level=%d\n", level);
-  for(auto &x: c->edit()->compact_pointers_) {
-    printf("cp level=%d ", x.first);
-    std::cout << x.second.user_key().ToString() << '\n';
-  }
-
   for(int i = 0; i < 2; i++) {
     printf("vector[%d] element:\n", i);
     for(int j = 0; j < c->num_input_files(i); j++) {
       FileMetaData *tmp = c->input(i, j);
       uint64_t number = tmp->number;
-      printf("number=%ld clock=%d ", 
-            number, get_clock());
+      printf("number=%ld clock=%d ", number, get_clock());
         // std::cout << "smallest_key="<< tmp->smallest.user_key().ToString()
         //       << " largest_key=" << tmp->largest.user_key().ToString();   
       if(pre.find(number) != pre.end()) {
         int lifetime = get_clock() - pre[number];
         printf(" lifetime=%d predict_time=%d predict_type=%d level_file_num=%d", lifetime, predict[number], predict_type[number], level_file_num[c->level() + i]);
         add_calc(c->level() + i, lifetime, predict[number]);
+      } else {
+        puts("GG");
       }
       putchar('\n');
     }
