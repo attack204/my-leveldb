@@ -27,7 +27,7 @@ enum LOG_TYPE{
   OTHER = 10
 };
 
-extern void add_flush(VersionEdit *edit);
+extern void add_flush(Version *v);
 extern void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c);
 
 static size_t TargetFileSize(const Options* options) {
@@ -601,7 +601,7 @@ class VersionSet::Builder {
   };
 
   VersionSet* vset_;
-  Version* base_;
+  Version* base_; //上一个版本的base file
   LevelState levels_[config::kNumLevels];
 
  public:
@@ -639,13 +639,15 @@ class VersionSet::Builder {
   // Apply all of the edits in *edit to the current state.
   void Apply(const VersionEdit* edit) {
     // Update compaction pointers
+    //枚举所有被修改的cp
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
-      const int level = edit->compact_pointers_[i].first;
+      const int level = edit->compact_pointers_[i].first; //获取更改的level
       vset_->compact_pointer_[level] =
-          edit->compact_pointers_[i].second.Encode().ToString();
+          edit->compact_pointers_[i].second.Encode().ToString(); //修改vset_的cp
     }
 
     // Delete files
+    //将需要被删除的文件添加到levels
     for (const auto& deleted_file_set_kvp : edit->deleted_files_) {
       const int level = deleted_file_set_kvp.first;
       const uint64_t number = deleted_file_set_kvp.second;
@@ -683,28 +685,29 @@ class VersionSet::Builder {
   void SaveTo(Version* v) {
     BySmallestKey cmp;
     cmp.internal_comparator = &vset_->icmp_;
-    for (int level = 0; level < config::kNumLevels; level++) {
+    for (int level = 0; level < config::kNumLevels; level++) { //枚举所有level的文件
       // Merge the set of added files with the set of pre-existing files.
       // Drop any deleted files.  Store the result in *v.
-      const std::vector<FileMetaData*>& base_files = base_->files_[level];
-      std::vector<FileMetaData*>::const_iterator base_iter = base_files.begin();
-      std::vector<FileMetaData*>::const_iterator base_end = base_files.end();
-      const FileSet* added_files = levels_[level].added_files;
-      v->files_[level].reserve(base_files.size() + added_files->size());
+      const std::vector<FileMetaData*>& base_files = base_->files_[level]; //获取到之前的所有文件列表
+      std::vector<FileMetaData*>::const_iterator base_iter = base_files.begin(); //获取vector的begin()指针
+      std::vector<FileMetaData*>::const_iterator base_end = base_files.end(); //获取vector的end()指针
+      const FileSet* added_files = levels_[level].added_files; //获取到所有待添加的file文件
+      v->files_[level].reserve(base_files.size() + added_files->size()); //重新申请需要的空间
       for (const auto& added_file : *added_files) {
         // Add all smaller files listed in base_
+        //在base_iter到base_end之间找到第一个比added_file大的文件，小的定义为若smellestKey小，则小
         for (std::vector<FileMetaData*>::const_iterator bpos =
                  std::upper_bound(base_iter, base_end, added_file, cmp);
-             base_iter != bpos; ++base_iter) {
-          MaybeAddFile(v, level, *base_iter);
+             base_iter != bpos; ++base_iter) { //枚举所有比bpos小的base_iter，保证新加的base file与前一个添加的added_file没有overlap
+          MaybeAddFile(v, level, *base_iter, 0);
         }
 
-        MaybeAddFile(v, level, added_file);
+        MaybeAddFile(v, level, added_file, 1);
       }
 
       // Add remaining base files
       for (; base_iter != base_end; ++base_iter) {
-        MaybeAddFile(v, level, *base_iter);
+        MaybeAddFile(v, level, *base_iter, 0);
       }
 
 #ifndef NDEBUG
@@ -725,11 +728,14 @@ class VersionSet::Builder {
     }
   }
 
-  void MaybeAddFile(Version* v, int level, FileMetaData* f) {
-    if (levels_[level].deleted_files.count(f->number) > 0) {
+
+  //保证f的SmallestKey要大于已经加入的所有文件的最大的key
+  //加了一个is_new_file参数，来统计所有真正被加入的new_file
+  void MaybeAddFile(Version* v, int level, FileMetaData* f, bool is_new_file) {
+    if (levels_[level].deleted_files.count(f->number) > 0) { //发现原level中的文件已经被删除了
       // File is deleted: do nothing
     } else {
-      std::vector<FileMetaData*>* files = &v->files_[level];
+      std::vector<FileMetaData*>* files = &v->files_[level]; //获取该level的所有文件
       if (level > 0 && !files->empty()) {
         // Must not overlap
         assert(vset_->icmp_.Compare((*files)[files->size() - 1]->largest,
@@ -737,6 +743,9 @@ class VersionSet::Builder {
       }
       f->refs++;
       files->push_back(f);
+      if(is_new_file) {
+          v->new_files[level].push_back(f);
+      }
     }
   }
 };
@@ -803,10 +812,13 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   Version* v = new Version(this);
   {
     Builder builder(this, current_);
+    
     builder.Apply(edit);
     builder.SaveTo(v);
+    add_flush(v);
   }
   Finalize(v);
+  
 
   // Initialize new descriptor log file if necessary by creating
   // a temporary file that contains a snapshot of the current version.
@@ -865,8 +877,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       env_->RemoveFile(new_manifest_file);
     }
   }
-  log_print("Flush", LOG_TYPE::FLUSH, 0, nullptr);
-  add_flush(edit);
+
   return s;
 }
 

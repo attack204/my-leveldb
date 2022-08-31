@@ -114,7 +114,7 @@ class Version {
   // Return a human readable string that describes this version's contents.
   std::string DebugString() const;
 
- private:
+ public:
   friend class Compaction;
   friend class VersionSet;
 
@@ -152,6 +152,8 @@ class Version {
 
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
+
+  std::vector<FileMetaData*> new_files[config::kNumLevels];
 
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
@@ -269,7 +271,7 @@ class VersionSet {
   };
   const char* LevelSummary(LevelSummaryStorage* scratch) const;
 
- private:
+ public:
   class Builder;
 
   friend class Compaction;

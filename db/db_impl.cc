@@ -45,8 +45,8 @@ enum LOG_TYPE {
 };
 void add_level_file_num(int level);
 void profiling_print();
-void add_outputs(DBImpl::CompactionState *c);
-void add_flush(VersionEdit *edit);
+// void add_outputs(DBImpl::CompactionState *c);
+void add_flush(Version *v);
 void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c);
 void print_compaction(Compaction *c, int level);
 const int kNumNonTableCacheFiles = 10;
@@ -557,6 +557,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
+  log_print("Flush", LOG_TYPE::FLUSH, level, nullptr);
   return s;
 }
 
@@ -765,7 +766,6 @@ void DBImpl::BackgroundCompaction() {
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
     CompactionState* compact = new CompactionState(c);
-    //在DoCompactionWork中统计了add_outputs
     status = DoCompactionWork(compact);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -1105,8 +1105,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
-  add_outputs(compact);
-
+ 
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
@@ -1633,6 +1632,7 @@ int flush_num, compaction_num;
 
 const int FlushLevel = 2;
 const int CompactLevel = 6;
+const int INF = 1e9;
 
 int flush_level[7]; //每个level被Flush的次数
 int compact_level[7]; //每个level被compact的次数
@@ -1647,9 +1647,61 @@ void add_level_file_num(int level) {
 int get_ave_time(int level) {
   return compact_level_lifetime[level] / compacted_number[level];
 }
+int min_int(int a, int b) {
+  return a < b ? a : b;
+}
+double get_factor(int level) {
+  double sum = 0;
+  for(int i = 0; i < 7; i++) {
+    sum += compact_level[i];
+  }
+  //return (double) sum / compact_level[level];
+  return 1;
+}
+//获取在满足largestKey > cp的前提下，有多少比这个file的LargetKey小
+int get_rank(int level, FileMetaData &file, Version *v) {
+  int first_large = -1, file_pos = -1, i = 0;
+  std::string cp = v->vset_->compact_pointer_[level];
+  //std::cout << cp << '\n';
+  for(i = 0; i < v->files_[level].size(); i++) {
+    if(cp.empty() || v->vset_->icmp_.Compare(v->files_[level][i]->largest.Encode(), cp) > 0) {
+      first_large = i;
+    }
+    if(v->files_[level][i]->number == file.number) {
+      file_pos = i;
+    }
+  }
+  if(first_large == -1) first_large = 0; //这里的次数非常少
+  
+  if(file_pos >= first_large) 
+    return file_pos - first_large; //如果说在first_large之后，那么rank就是file_pos - first_large
+  else 
+    return v->files_[level].size() - first_large + file_pos; //否则要转一圈才能compact
+}
 //目前的策略是根据平均时间来进行预测
-int get_predict(int level) {
-  return get_ave_time(level);
+int get_predict(int level, FileMetaData &file, Version *v) { 
+  std::string cp = v->vset_->compact_pointer_[level];
+  int T1 = get_rank(level, file, v) * get_factor(level);
+  int T2 = INF, times = 0;
+  if(level == 0) ;
+  else {
+    const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
+    const InternalKey* begin = &file.smallest;
+    const InternalKey* end   = &file.largest;
+    for(int i = 0; i < v->files_[level - 1].size(); i++) {
+      FileMetaData *f = v->files_[level - 1][i];
+      const Slice file_start = f->smallest.user_key();
+      const Slice file_limit = f->largest.user_key();
+      if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
+        // "f" is completely before specified range; skip it
+      } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
+        // "f" is completely after specified range; skip it
+      } else {
+        T2 = min_int(T2, get_rank(level - 1, *f, v) * get_factor(level));
+      }
+    }
+  }
+  return min_int(T1, T2);
 }
 double get_predict_rate(int level) {
   return (double) correct_predict_time[level] / compacted_number[level];
@@ -1681,7 +1733,6 @@ void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
   if((flush_num + compaction_num) % 50 == 0) {
     profiling_print();
   }
-
 }
 
 //compact完成后调用此函数
@@ -1728,28 +1779,50 @@ void profiling_print() {
   }
 }
 
-//Compact完成后调用此函数添加新生成的SST file
-//初始化SST file被创建的时间，进行predict预测
-//add Compact file; update pre[] and make_predict
-void add_outputs(DBImpl::CompactionState *c) {
-  for(int i = 0; i < c->outputs.size(); i++) {
-    DBImpl::CompactionState::Output x = c->outputs[i];
-    pre[x.number] = get_clock();
-    int predict_time = get_predict(c->compaction->level());
-    level_file_num[c->compaction->level()]++;
-    predict[x.number] = predict_time;
-    printf("pre_number=%ld clock=%d predict=%d\n", x.number, get_clock(), predict_time);
+//flush/compact完成后调用此函数更新信息
+void add_flush(Version *v) {
+  // 貌似不能这么直接改
+  // for(int i = 0; i < config::kNumLevels; i++) {
+  //   level_file_num[i] = v->files_[i].size;
+  // }
+  for(int level = 0; level < config::kNumLevels; level++) {
+    for(int i = 0; i < v->new_files[level].size(); i++) {
+      FileMetaData *y = v->new_files[level][i]; 
+      level_file_num[level]++; //level
+      int predict_time = get_predict(level, *y, v);
+      predict[y->number] = predict_time;
+      pre[y->number] = get_clock();
+      printf("pre_number=%ld clock=%d predict=%d\n", y->number, get_clock(), predict_time);  
+    }
   }
-}
-//Flush完成后调用此函数添加新生成的SST file
-void add_flush(VersionEdit *edit) {
-  for(auto &x: edit->new_files_) {
-    auto &y = x.second;
-    level_file_num[x.first]++;
-    pre[y.number] = get_clock();
-    printf("flush_pre_number=%ld clock=%d\n", y.number, get_clock());
-  }
+  // for(std::pair<int, FileMetaData> &x: edit->new_files_) {
+  //   int level = x.first;
+  //   FileMetaData &y = x.second; 
+  //   level_file_num[level]++; //level
+  //   int predict_time = get_predict(level, y, v);
+  //   predict[y.number] = predict_time;
+  //   pre[y.number] = get_clock();
+  //   printf("pre_number=%ld clock=%d predict=%d\n", y.number, get_clock(), predict_time);
+  // }
 }
 
 
 }  // namespace leveldb
+
+
+
+
+
+// //Compact完成后调用此函数添加新生成的SST file
+// //初始化SST file被创建的时间，进行predict预测
+// //add Compact file; update pre[] and make_predict
+// void add_outputs(DBImpl::CompactionState *c) {
+//   for(int i = 0; i < c->outputs.size(); i++) {
+//     DBImpl::CompactionState::Output x = c->outputs[i];
+//     pre[x.number] = get_clock();
+//     int predict_time = get_predict(c->compaction->level());
+//     level_file_num[c->compaction->level()]++;
+//     predict[x.number] = predict_time;
+//     printf("pre_number=%ld clock=%d predict=%d\n", x.number, get_clock(), predict_time);
+//   }
+// }
