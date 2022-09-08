@@ -150,6 +150,8 @@ class Version {
   Version* prev_;     // Previous version in linked list
   int refs_;          // Number of live refs to this version
 
+
+  //Q: files和new_files有什么区别？
   // List of files per level
   std::vector<FileMetaData*> files_[config::kNumLevels];
 

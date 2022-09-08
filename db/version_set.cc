@@ -682,13 +682,14 @@ class VersionSet::Builder {
   }
 
   // Save the current state in *v.
+  //实现的方式是将上个version的files中的文件(base->files_[level])加到新的version中
   void SaveTo(Version* v) {
     BySmallestKey cmp;
     cmp.internal_comparator = &vset_->icmp_;
     for (int level = 0; level < config::kNumLevels; level++) { //枚举所有level的文件
       // Merge the set of added files with the set of pre-existing files.
       // Drop any deleted files.  Store the result in *v.
-      const std::vector<FileMetaData*>& base_files = base_->files_[level]; //获取到之前的所有文件列表
+      const std::vector<FileMetaData*>& base_files = base_->files_[level]; //获取到上个版本的所有文件列表
       std::vector<FileMetaData*>::const_iterator base_iter = base_files.begin(); //获取vector的begin()指针
       std::vector<FileMetaData*>::const_iterator base_end = base_files.end(); //获取vector的end()指针
       const FileSet* added_files = levels_[level].added_files; //获取到所有待添加的file文件
@@ -743,6 +744,7 @@ class VersionSet::Builder {
       }
       f->refs++;
       files->push_back(f);
+      //这个new_files是后来自己加的
       if(is_new_file) {
           v->new_files[level].push_back(f);
       }
@@ -815,10 +817,9 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     
     builder.Apply(edit);
     builder.SaveTo(v);
-    add_flush(v);
   }
   Finalize(v);
-  
+  add_flush(v);
 
   // Initialize new descriptor log file if necessary by creating
   // a temporary file that contains a snapshot of the current version.

@@ -530,6 +530,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   Status s;
   {
     mutex_.Unlock();
+    //构造FileMetaData的信息
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
     mutex_.Lock();
   }
@@ -552,7 +553,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
     edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
                   meta.largest);
   }
-
+  //printf("edit %d\n", edit->new_files_.size());
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
@@ -756,7 +757,7 @@ void DBImpl::BackgroundCompaction() {
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                        f->largest);
-    add_level_file_num(c->level() + 1);
+   // add_level_file_num(c->level() + 1);
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -1776,7 +1777,7 @@ void print_compaction(Compaction *c, int level) {
         printf(" lifetime=%d predict_time=%d predict_type=%d level_file_num=%d", lifetime, predict[number], predict_type[number], level_file_num[c->level() + i]);
         add_calc(c->level() + i, lifetime, predict[number]);
       } else {
-        puts("GG");
+        puts("GG"); //can't reach here
       }
       putchar('\n');
     }
@@ -1786,24 +1787,26 @@ void print_compaction(Compaction *c, int level) {
 //flush/compact的最后后调用此函数, 此函数可以调用最新的Version信息
 void add_flush(Version *v) {
   puts("AllFiles");
+  //这里打log要打所有file的log
   for(int level = 0; level < config::kNumLevels; level++) {
-    printf("level %d:", level);
-    for(int i = 0; i < v->new_files[level].size(); i++) {
-      FileMetaData *tmp = v->new_files[level][i];
+    printf("level %d files num:%ld: ", level, v->files_[level].size());
+    for(int i = 0; i < v->files_[level].size(); i++) {
+      FileMetaData *tmp = v->files_[level][i];
       std::cout << "["<< tmp->smallest.user_key().ToString()
                 << "," << tmp->largest.user_key().ToString()
                 << "]";
     }
     puts("");
   }
+  //这里是预测SST file的lifetime，因此只需要枚举new_files
   for(int level = 0; level < config::kNumLevels; level++) {
     for(int i = 0; i < v->new_files[level].size(); i++) {
       FileMetaData *y = v->new_files[level][i]; 
-      level_file_num[level]++; //level
+      level_file_num[level] = v->files_[level].size(); //level
       get_predict(level, *y, v, predict[y->number], predict_type[y->number]);
      // predict[y->number] *= 4;
       pre[y->number] = get_clock();
-      printf("pre_number=%ld clock=%d predict=%d\n", y->number, get_clock(), predict[y->number]);  
+      printf("pre_number=%ld clock=%d predict_lifetime=%d\n", y->number, get_clock(), predict[y->number]);  
     }
   }
 }
