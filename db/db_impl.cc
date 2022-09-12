@@ -12,7 +12,8 @@
 #include <string>
 #include <vector>
 #include <iostream>
-
+#include <mutex>
+#include <cstdlib>
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -45,6 +46,7 @@ enum LOG_TYPE {
 };
 void add_level_file_num(int level);
 void profiling_print();
+void all_profiling_print();
 // void add_outputs(DBImpl::CompactionState *c);
 void add_flush(Version *v);
 void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c);
@@ -164,6 +166,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
 
 DBImpl::~DBImpl() {
   profiling_print();
+  all_profiling_print();
   // Wait for background work to finish.
   mutex_.Lock();
   shutting_down_.store(true, std::memory_order_release);
@@ -1638,16 +1641,18 @@ const int CompactLevel = 6;
 const int INF = 1e9;
 
 
-int flush_level[7]; //每个level被Flush的次数
-int compact_level[7]; //每个level被compact的次数
-uint64_t compact_level_lifetime[7]; //被compact的SST file的总的lifetime
-uint32_t correct_predict_time[7]; //进行了预测的SST file中正确预测的文件数量
-uint32_t compacted_number[7]; //进行了预测的SST file中被合并的文件数量
-uint32_t level_file_num[7];
+int flush_level[8]; //每个level被Flush的次数
+int compact_level[8]; //每个level被compact的次数
+uint64_t compact_level_lifetime[8]; //被compact的SST file的总的lifetime
+uint32_t correct_predict_time[8]; //进行了预测的SST file中正确预测的文件数量
+uint32_t compacted_number[8]; //进行了预测的SST file中被合并的文件数量
+uint32_t level_file_num[8];
 const int PREDICT_THRESHOLD = 10;
 std::map<int, int> pre; //key: file_number value: file被创建的时间
 std::map<int, int> predict; //key: file_number value: 预测的lifetime的值
 std::map<int, int> predict_type;
+std::map<uint64_t, int> number_life;
+std::map<uint64_t, int> number_level;
 void add_level_file_num(int level) {
   level_file_num[level]++;
 }
@@ -1660,14 +1665,34 @@ double get_predict_rate(int level) {
 int min_int(int a, int b) {
   return a < b ? a : b;
 }
-
-double get_factor(int level) {
-  double sum = 0;
-  for(int i = 0; i < 7; i++) {
-    sum += compact_level[i];
+int max_int(int a, int b) {
+  return a > b ? a : b;
+}
+int last_compact[8];
+int level_round[8];
+int star_time[8] = {0, 0, 0, 0, 0, 530};
+void update_factor_predict(int level) {
+  if(last_compact[level] != 0 && (get_clock() - last_compact[level] > level_round[level])) {
+    level_round[level] = get_clock() - last_compact[level];
   }
-  //return (double) sum / compact_level[level];
-  return 1;
+  last_compact[level] = get_clock();
+  FILE * fp = fopen("last_compact.out", "a");
+  if(level <= 6)
+    fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
+  fclose(fp);
+}
+//距离下次level发生大批量的compact还需要经过多少时间
+int get_factor(int level) {
+  int factor = level_round[level] < 10 ? 100 : level_round[level];
+  FILE * fp = fopen("factor.out", "a");
+  if(level <= 6)
+    fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
+  fclose(fp);
+  if(last_compact[level] != 0 && level_round[level] > 50) 
+    return level_round[level] - (get_clock() - last_compact[level]);
+  else
+    //return star_time[level] - get_clock();
+    return 20;
 }
 //获取在满足largestKey > cp的前提下，有多少比这个file的LargetKey小
 int get_rank(int level, FileMetaData &file, Version *v) {
@@ -1707,7 +1732,7 @@ void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int 
     } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
       // "f" is completely after specified range; skip it
     } else {
-      int T2 = get_rank(upper_level, *f, v) * get_factor(upper_level) + pre_time;
+      int T2 = get_rank(upper_level, *f, v) + get_factor(upper_level) + pre_time;
       if(T2 < predict) {
         predict = T2;
         predict_type = deep;
@@ -1721,38 +1746,53 @@ void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int 
 //目前的策略是根据平均时间来进行预测
 void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &predict_type) { 
   std::string cp = v->vset_->compact_pointer_[level];
-  predict = get_rank(level, file, v) * get_factor(level);
+  predict = get_rank(level, file, v) + get_factor(level);
   predict_type = 0;
-  int T2 = INF, times = 0;
   if(level == 0) ;
   else {
-    dfs(level, 0, file, v, 0, predict, predict_type);
+   // dfs(level, 0, file, v, 0, predict, predict_type);
   }
+  if(predict == 0) predict = 1; //lifetime can't = 0
 }
+class life_meta {
+public:
+  life_meta(int lifetime_, int predict_lifetime_) {
+    lifetime = lifetime_;
+    predict_lifetime = predict_lifetime_;
+  }
+  int lifetime;
+  int predict_lifetime;
+};
+std::map<int, std::vector<life_meta> > life_profiling;
 //level层的某个文件被compact后调用
 //统计相关信息
-void add_calc(int level, int lifetime, int predict_lifetime) {
-  level_file_num[level]--;
+void add_calc(int level, int lifetime, int predict_lifetime, int type) {
   compacted_number[level]++;
   correct_predict_time[level] += (abs(lifetime - predict_lifetime) <= PREDICT_THRESHOLD);
   compact_level_lifetime[level] += lifetime;
+  //if(type == 0)  //加了这个只会统计T1
+    life_profiling[level].push_back(life_meta(lifetime, predict_lifetime));
 }
-
+std::mutex mtx;
 //Compact/Flush之前调用log_print来打印相关日志
 void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
- 
-  printf("%s flush_num=%d compaction_num=%d level=%d\n", s, flush_num, compaction_num, level);
+  mtx.lock();
   if(log_type == FLUSH) {
     flush_num++;
     flush_level[level]++;
   } else if(log_type == COMPACTION) {
-    if(c == nullptr) return;
-    print_compaction(c, level);
+    compaction_num++;
+    compact_level[level]++;
+  }
+  printf("%s flush_num=%d compaction_num=%d time=%d level=%d\n", s, flush_num, compaction_num, get_clock(), level);
+  if(log_type == COMPACTION) {
+     print_compaction(c, level);
   }
 
   if((flush_num + compaction_num) % 50 == 0) {
     profiling_print();
   }
+   mtx.unlock();
 }
 
 //compact pickCompaction之后调用此函数
@@ -1760,10 +1800,11 @@ void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
 //1. 打印SST file的信息number, lifetime, predict_time
 //2. 更新add_calc级预测的准确率以及被compact的file的总lifetime
 void print_compaction(Compaction *c, int level) {
+  FILE * fp = fopen("level.out", "a");
+  fprintf(fp, "%d %d\n", get_clock(), level);
   if(c == nullptr) return ;
-  compaction_num++;
-  compact_level[level]++;
   printf("level=%d\n", level);
+  update_factor_predict(level);
   for(int i = 0; i < 2; i++) {
     printf("vector[%d] element:\n", i);
     for(int j = 0; j < c->num_input_files(i); j++) {
@@ -1775,7 +1816,9 @@ void print_compaction(Compaction *c, int level) {
       if(pre.find(number) != pre.end()) {
         int lifetime = get_clock() - pre[number];
         printf(" lifetime=%d predict_time=%d predict_type=%d level_file_num=%d", lifetime, predict[number], predict_type[number], level_file_num[c->level() + i]);
-        add_calc(c->level() + i, lifetime, predict[number]);
+        number_life[number] = lifetime;
+        number_level[number] = level;
+        add_calc(c->level() + i, lifetime, predict[number], i);
       } else {
         puts("GG"); //can't reach here
       }
@@ -1786,6 +1829,7 @@ void print_compaction(Compaction *c, int level) {
 
 //flush/compact的最后后调用此函数, 此函数可以调用最新的Version信息
 void add_flush(Version *v) {
+  mtx.lock();
   puts("AllFiles");
   //这里打log要打所有file的log
   for(int level = 0; level < config::kNumLevels; level++) {
@@ -1804,14 +1848,16 @@ void add_flush(Version *v) {
       FileMetaData *y = v->new_files[level][i]; 
       level_file_num[level] = v->files_[level].size(); //level
       get_predict(level, *y, v, predict[y->number], predict_type[y->number]);
-     // predict[y->number] *= 4;
       pre[y->number] = get_clock();
-      printf("pre_number=%ld clock=%d predict_lifetime=%d\n", y->number, get_clock(), predict[y->number]);  
+      printf("new_sst_file_number=%ld clock=%d predict_lifetime=%d\n", y->number, get_clock(), predict[y->number]);  
     }
   }
+  puts("------End-----------");
+    mtx.unlock();
 }
 
 
+std::map<int, int> life_layer;
 
 //每50次Compact会调用此函数打印状态
 //printf profiling information
@@ -1823,6 +1869,27 @@ void profiling_print() {
   for(int i = 0; i <= CompactLevel; i++) {
     printf("CompactLevel %d=%d ave_lifetime=%d rate=%.2lf level_file_num=%d\n", i, compact_level[i], get_ave_time(i), get_predict_rate(i), level_file_num[i]);
   }
+
+
+}
+void all_profiling_print() {
+  printf("%d\n", number_life.size());
+  FILE * fp_ = fopen("number_life.out", "a");
+  for(auto &x: number_life) {
+    fprintf(fp_, "number=%d level=%d lifetime=%d predict=%d\n", x.first, number_level[x.first], x.second, predict[x.first]);
+  }
+
+  FILE * fp = fopen("lifetime.out", "a");
+  for(int i = 0; i <= CompactLevel; i++) {;
+    for(auto &x: life_profiling[i]) {
+        int diff_time = x.predict_lifetime - x.lifetime;
+        fprintf(fp, "%d %d\n", i, diff_time);
+    }
+  }
+  //fclose(fp);
+
+  //fclose(fp_);
+
 }
 
 
