@@ -1670,10 +1670,11 @@ int max_int(int a, int b) {
 }
 int last_compact[8];
 int level_round[8];
-int star_time[8] = {0, 0, 0, 0, 0, 530};
+int star_time[8];
 void update_factor_predict(int level) {
   if(last_compact[level] != 0 && (get_clock() - last_compact[level] > level_round[level])) {
     level_round[level] = get_clock() - last_compact[level];
+    star_time[level] = get_clock();
   }
   last_compact[level] = get_clock();
   FILE * fp = fopen("last_compact.out", "a");
@@ -1684,15 +1685,27 @@ void update_factor_predict(int level) {
 //距离下次level发生大批量的compact还需要经过多少时间
 int get_factor(int level) {
   int factor = level_round[level] < 10 ? 100 : level_round[level];
-  FILE * fp = fopen("factor.out", "a");
-  if(level <= 6)
-    fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
-  fclose(fp);
+  // FILE * fp = fopen("factor.out", "a");
+  // if(level <= 6)
+  //   fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
+  // fclose(fp);
   if(last_compact[level] != 0 && level_round[level] > 50) 
     return level_round[level] - (get_clock() - last_compact[level]);
   else
     //return star_time[level] - get_clock();
-    return 20;
+    return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact
+}
+int get_factor_T2(int level) {
+  int factor = level_round[level] < 10 ? 100 : level_round[level];
+  // FILE * fp = fopen("factor.out", "a");
+  // if(level <= 6)
+  //   fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
+  // fclose(fp);
+  if(level_round[level] > 50) 
+    return level_round[level];
+  else
+    //return star_time[level] - get_clock();
+    return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact  
 }
 //获取在满足largestKey > cp的前提下，有多少比这个file的LargetKey小
 int get_rank(int level, FileMetaData &file, Version *v) {
@@ -1732,7 +1745,8 @@ void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int 
     } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
       // "f" is completely after specified range; skip it
     } else {
-      int T2 = get_rank(upper_level, *f, v) + get_factor(upper_level) + pre_time;
+      int rank = get_rank(upper_level, *f, v);
+      int T2 = rank + pre_time + get_factor_T2(upper_level);
       if(T2 < predict) {
         predict = T2;
         predict_type = deep;
@@ -1745,15 +1759,18 @@ void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int 
 
 //目前的策略是根据平均时间来进行预测
 void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &predict_type) { 
-  std::string cp = v->vset_->compact_pointer_[level];
-  predict = get_rank(level, file, v) + get_factor(level);
-  predict_type = 0;
   if(level == 0) ;
   else {
-   // dfs(level, 0, file, v, 0, predict, predict_type);
+    dfs(level, 0, file, v, 0, predict, predict_type);
+  }
+  if(predict == 0) { //加了这个if可以屏蔽掉T1的predict
+      predict = get_rank(level, file, v) + get_factor(level);
+      predict_type = 0;
   }
   if(predict == 0) predict = 1; //lifetime can't = 0
+  
 }
+
 class life_meta {
 public:
   life_meta(int lifetime_, int predict_lifetime_) {
@@ -1770,7 +1787,7 @@ void add_calc(int level, int lifetime, int predict_lifetime, int type) {
   compacted_number[level]++;
   correct_predict_time[level] += (abs(lifetime - predict_lifetime) <= PREDICT_THRESHOLD);
   compact_level_lifetime[level] += lifetime;
-  //if(type == 0)  //加了这个只会统计T1
+  if(type == 1)  //加了这个只会统计T1
     life_profiling[level].push_back(life_meta(lifetime, predict_lifetime));
 }
 std::mutex mtx;
