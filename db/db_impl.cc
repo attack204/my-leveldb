@@ -1634,8 +1634,8 @@ Status DestroyDB(const std::string& dbname, const Options& options) {
 }
 
 int flush_num, compaction_num;
+//#define get_clock() (flush_num + compaction_num)
 #define get_clock() (flush_num + compaction_num)
-
 const int FlushLevel = 2;
 const int CompactLevel = 6;
 const int INF = 1e9;
@@ -1647,12 +1647,13 @@ uint64_t compact_level_lifetime[8]; //被compact的SST file的总的lifetime
 uint32_t correct_predict_time[8]; //进行了预测的SST file中正确预测的文件数量
 uint32_t compacted_number[8]; //进行了预测的SST file中被合并的文件数量
 uint32_t level_file_num[8];
-const int PREDICT_THRESHOLD = 10;
+const int PREDICT_THRESHOLD = 25;
 std::map<int, int> pre; //key: file_number value: file被创建的时间
 std::map<int, int> predict; //key: file_number value: 预测的lifetime的值
 std::map<int, int> predict_type;
 std::map<uint64_t, int> number_life;
 std::map<uint64_t, int> number_level;
+std::vector<int> time_level; //Flush/Compaction的level按时间递增的分布
 void add_level_file_num(int level) {
   level_file_num[level]++;
 }
@@ -1669,8 +1670,16 @@ int max_int(int a, int b) {
   return a > b ? a : b;
 }
 int last_compact[8];
-int level_round[8];
 int star_time[8];
+int level_round[8];
+int level_len[8] = {10, 5, 40, 12, 10, 15};
+const int CYCLE = 95;
+
+
+
+//  int level_len[8] = {10, 11, 20, 20, 7, 10};
+// const int CYCLE = 65;
+
 void update_factor_predict(int level) {
   if(last_compact[level] != 0 && (get_clock() - last_compact[level] > level_round[level])) {
     level_round[level] = get_clock() - last_compact[level];
@@ -1682,38 +1691,15 @@ void update_factor_predict(int level) {
     fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
   fclose(fp);
 }
-//距离下次level发生大批量的compact还需要经过多少时间
-int get_factor(int level) {
-  int factor = level_round[level] < 10 ? 100 : level_round[level];
-  // FILE * fp = fopen("factor.out", "a");
-  // if(level <= 6)
-  //   fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
-  // fclose(fp);
-  if(last_compact[level] != 0 && level_round[level] > 50) 
-    return level_round[level] - (get_clock() - last_compact[level]);
-  else
-    //return star_time[level] - get_clock();
-    return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact
-}
-int get_factor_T2(int level) {
-  int factor = level_round[level] < 10 ? 100 : level_round[level];
-  // FILE * fp = fopen("factor.out", "a");
-  // if(level <= 6)
-  //   fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
-  // fclose(fp);
-  if(level_round[level] > 50) 
-    return level_round[level];
-  else
-    //return star_time[level] - get_clock();
-    return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact  
-}
+
 //获取在满足largestKey > cp的前提下，有多少比这个file的LargetKey小
 int get_rank(int level, FileMetaData &file, Version *v) {
+
   int first_large = -1, file_pos = -1, i = 0;
   std::string cp = v->vset_->compact_pointer_[level];
   //std::cout << cp << '\n';
   for(i = 0; i < v->files_[level].size(); i++) {
-    if(cp.empty() || v->vset_->icmp_.Compare(v->files_[level][i]->largest.Encode(), cp) > 0) {
+    if((cp.empty() || v->vset_->icmp_.Compare(v->files_[level][i]->largest.Encode(), cp) > 0) && first_large == -1) {
       first_large = i;
     }
     if(v->files_[level][i]->number == file.number) {
@@ -1722,10 +1708,56 @@ int get_rank(int level, FileMetaData &file, Version *v) {
   }
   if(first_large == -1) first_large = 0; //这里的次数非常少
   
+  int result;
+
   if(file_pos >= first_large) 
-    return file_pos - first_large; //如果说在first_large之后，那么rank就是file_pos - first_large
+    result = file_pos - first_large; //如果说在first_large之后，那么rank就是file_pos - first_large
   else 
-    return v->files_[level].size() - first_large + file_pos; //否则要转一圈才能compact
+    result = v->files_[level].size() - first_large + file_pos; //否则要转一圈才能compact
+
+  printf("get_rank first_large=%d file_pos=%d files[level].size()=%d result=%d\n", first_large, file_pos, v->files_[level].size(), result);
+
+  return result;
+}
+
+
+//获取在满足largestKey > cp的前提下，有多少比这个file的LargetKey小
+int get_rank2(int level, FileMetaData &file, Version *v) {
+  const Comparator* user_cmp = v->vset_->icmp_.user_comparator();
+  int first_large = -1, file_pos = -1, i = 0;
+  std::string cp = v->vset_->compact_pointer_[level];
+  //std::cout << cp << '\n';
+  for(i = 0; i < v->files_[level].size(); i++) {
+    if((cp.empty() || v->vset_->icmp_.Compare(v->files_[level][i]->largest.Encode(), cp) > 0) && first_large == -1) {
+      first_large = i;
+    }
+
+    if(v->vset_->icmp_.Compare(file.smallest, v->files_[level][i]->smallest) > 0) {
+      file_pos = i; //这里没有break，就是希望它每次更新
+    }
+  }
+  if(first_large == -1) first_large = 0; //这里的次数非常少
+  
+  int result;
+
+  if(file_pos >= first_large) 
+    result = file_pos - first_large; //如果说在first_large之后，那么rank就是file_pos - first_large
+  else 
+    result = v->files_[level].size() - first_large + file_pos; //否则要转一圈才能compact
+
+  printf("get_rank2 first_large=%d file_pos=%d files[level].size()=%d result=%d\n", first_large, file_pos, v->files_[level].size(), result);
+
+  return result;
+}
+
+
+int get_offset(int level) {
+  int res = level_len[level];
+  for(int i = time_level.size() - 1; i >= 0 && (time_level.size() - i) <= level_len[level]; i--) {
+    if(time_level[i] == level)
+      res--;
+  }
+  return res;
 }
 
 //pre_time是之前的层所消耗的时间
@@ -1739,35 +1771,78 @@ void dfs(int level, int deep, FileMetaData &file, Version *v, int pre_time, int 
   for(int i = 0; i < v->files_[upper_level].size(); i++) {
     FileMetaData *f = v->files_[upper_level][i];
     const Slice file_start = f->smallest.user_key();
-    const Slice file_limit = f->largest.user_key();
-    if (begin != nullptr && user_cmp->Compare(file_limit, begin->Encode()) < 0) {
+    const Slice file_end = f->largest.user_key();
+    if (begin != nullptr && user_cmp->Compare(file_end, begin->Encode()) < 0) {
       // "f" is completely before specified range; skip it
     } else if (end != nullptr && user_cmp->Compare(file_start, end->Encode()) > 0) {
       // "f" is completely after specified range; skip it
     } else {
       int rank = get_rank(upper_level, *f, v);
-      int T2 = rank + pre_time + get_factor_T2(upper_level);
+      int offset = get_offset(upper_level);
+      int T2;
+      if(deep == -1) {
+        if(rank <= offset)
+          T2 = rank;
+        else { 
+          rank -= offset;
+          T2 = CYCLE * (rank / level_len[upper_level]) + rank % level_len[upper_level] + CYCLE - level_len[level];
+        }
+      } else {
+        T2 =  CYCLE * (rank / level_len[upper_level]) + rank % level_len[upper_level];
+      }
       if(T2 < predict) {
-        predict = T2;
+        predict = T2 + pre_time;
         predict_type = deep;
       }
-      dfs(level - 1, deep - 1, *f, v, pre_time + T2, predict, predict_type);
+      dfs(level - 1, deep - 1, file, v, pre_time + T2, predict, predict_type);
     }
   }
 }
 
 
+
 //目前的策略是根据平均时间来进行预测
-void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &predict_type) { 
+void get_predict(int level, FileMetaData &file, Version *v, int &predict, int &predict_type, int &tmp_rank) { 
+  predict = INF;
+  //level=5被level=1-4存在的compact
+  //实际上被level=3 compact掉的情况非常少，因为level=3本来就没有多少SST file
   if(level == 0) ;
   else {
-    dfs(level, 0, file, v, 0, predict, predict_type);
+    dfs(level, -1, file, v, 0, predict, predict_type); //注释掉这个可以屏蔽T2的predict
   }
-  if(predict == 0) { //加了这个if可以屏蔽掉T1的predict
-      predict = get_rank(level, file, v) + get_factor(level);
-      predict_type = 0;
+
+  //被level=4某个不存在SST file compact掉，我们假设此SST file存在
+  if(predict == INF && level != 0) { //目前我们认为只有当没有overlap的时候才会触发此算法
+    int upper_level = level - 1;
+    int rank = get_rank2(upper_level, file, v);
+    int offset = get_offset(upper_level);
+    int T3;
+    if(rank <= offset)
+        T3 = rank;
+      else { 
+        rank -= offset;
+        T3 = CYCLE * (rank / level_len[upper_level]) + rank % level_len[upper_level] + CYCLE - level_len[level];
+      }
+    if(T3 < predict) {
+      predict = T3;
+      predict_type = 1;
+    }
   }
-  if(predict == 0) predict = 1; //lifetime can't = 0
+
+  // //level=5自己触发compaction将自己compact掉
+  // if(predict == INF) { //加了这个if可以屏蔽掉T1的predict
+  //   int rank = get_rank(level, file, v);
+  //   tmp_rank = rank;
+  //   int T1 = CYCLE * (rank / level_len[level]) + rank % level_len[level];
+  //   int upper_level = level - 1;
+  //   if(upper_level != -1) 
+  //     T1 += get_offset(upper_level);
+  //   if(T1 < predict) {
+  //     predict = T1;
+  //     predict_type = 0;
+  //   }
+  // }
+  if(predict == INF) predict = 1; //lifetime can't = 0
   
 }
 
@@ -1787,7 +1862,7 @@ void add_calc(int level, int lifetime, int predict_lifetime, int type) {
   compacted_number[level]++;
   correct_predict_time[level] += (abs(lifetime - predict_lifetime) <= PREDICT_THRESHOLD);
   compact_level_lifetime[level] += lifetime;
-  if(type == 1)  //加了这个只会统计T1
+ // if(type == 1)  //type = 0统计T1，type=1统计T2
     life_profiling[level].push_back(life_meta(lifetime, predict_lifetime));
 }
 std::mutex mtx;
@@ -1797,10 +1872,15 @@ void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
   if(log_type == FLUSH) {
     flush_num++;
     flush_level[level]++;
+    time_level.push_back(level);
   } else if(log_type == COMPACTION) {
     compaction_num++;
     compact_level[level]++;
+    time_level.push_back(level);
   }
+  FILE * fp = fopen("level.out", "a");
+  fprintf(fp, "%d %d\n", get_clock(), level);
+  fclose(fp);
   printf("%s flush_num=%d compaction_num=%d time=%d level=%d\n", s, flush_num, compaction_num, get_clock(), level);
   if(log_type == COMPACTION) {
      print_compaction(c, level);
@@ -1817,8 +1897,7 @@ void log_print(const char *s, LOG_TYPE log_type, int level, Compaction *c) {
 //1. 打印SST file的信息number, lifetime, predict_time
 //2. 更新add_calc级预测的准确率以及被compact的file的总lifetime
 void print_compaction(Compaction *c, int level) {
-  FILE * fp = fopen("level.out", "a");
-  fprintf(fp, "%d %d\n", get_clock(), level);
+
   if(c == nullptr) return ;
   printf("level=%d\n", level);
   update_factor_predict(level);
@@ -1864,9 +1943,10 @@ void add_flush(Version *v) {
     for(int i = 0; i < v->new_files[level].size(); i++) {
       FileMetaData *y = v->new_files[level][i]; 
       level_file_num[level] = v->files_[level].size(); //level
-      get_predict(level, *y, v, predict[y->number], predict_type[y->number]);
+      int rank;
+      get_predict(level, *y, v, predict[y->number], predict_type[y->number], rank);
       pre[y->number] = get_clock();
-      printf("new_sst_file_number=%ld clock=%d predict_lifetime=%d\n", y->number, get_clock(), predict[y->number]);  
+      printf("new_sst_file_number=%ld level=%d rank=%d clock=%d predict_lifetime=%d predict_type=%d\n", y->number, level, rank, get_clock(), predict[y->number], predict_type[y->number]);  
     }
   }
   puts("------End-----------");
@@ -1890,12 +1970,12 @@ void profiling_print() {
 
 }
 void all_profiling_print() {
-  printf("%d\n", number_life.size());
+
   FILE * fp_ = fopen("number_life.out", "a");
   for(auto &x: number_life) {
     fprintf(fp_, "number=%d level=%d lifetime=%d predict=%d\n", x.first, number_level[x.first], x.second, predict[x.first]);
   }
-
+  fclose(fp_);
   FILE * fp = fopen("lifetime.out", "a");
   for(int i = 0; i <= CompactLevel; i++) {;
     for(auto &x: life_profiling[i]) {
@@ -1903,11 +1983,30 @@ void all_profiling_print() {
         fprintf(fp, "%d %d\n", i, diff_time);
     }
   }
-  //fclose(fp);
-
-  //fclose(fp_);
-
+  fclose(fp);
 }
+
+// //距离下次level发生大批量的compact还需要经过多少时间
+// int get_factor(int level) {
+//   int factor = level_round[level] < 10 ? 100 : level_round[level];
+//   // FILE * fp = fopen("factor.out", "a");
+//   // if(level <= 6)
+//   //   fprintf(fp, "time=%d level=%d level_round=%d last_compact=%d\n", get_clock(), level, level_round[level], last_compact[level]);
+//   // fclose(fp);
+//   if(last_compact[level] != 0 && level_round[level] > 50) 
+//     return level_round[level] - (get_clock() - last_compact[level]);
+//   else
+//     //return star_time[level] - get_clock();
+//     return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact
+// }
+// int get_factor_T2(int level) {
+//   int factor = level_round[level] < 10 ? 100 : level_round[level];
+//   if(level_round[level] > 50) 
+//     return level_round[level];
+//   else
+//     //return star_time[level] - get_clock();
+//     return 100; //如果说该level没有触发过compact，那么我们认为会在200个时钟周期后触发compact  
+// }
 
 
 }  // namespace leveldb

@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-
+THRESHOLD = 25 
 num_list = []
 x_list = []
 data_list = []
@@ -10,12 +10,17 @@ for line in open("lifetime.out"):
         x_list.append(int(line.split(' ')[0]))
         num_list.append(int(line.split(' ')[1]))
 
-
+tot = 0
+correct = 0
 for i in range(0, len(x_list)):
     if x_list[i] == 5:
         print(num_list[i])
         data_list.append(num_list[i])
+        tot = tot + 1
+        if num_list[i] >= -THRESHOLD and num_list[i] <= THRESHOLD:
+            correct = correct + 1;
 
+print(correct / tot)
 plt.hist(data_list, bins=20)
 
 plt.show()
